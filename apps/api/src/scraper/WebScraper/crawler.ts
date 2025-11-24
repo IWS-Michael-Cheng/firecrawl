@@ -35,6 +35,7 @@ enum DenialReason {
   SOCIAL_MEDIA = "URL is a social media or email link",
   EXTERNAL_LINK = "External URL not allowed",
   SECTION_LINK = "URL contains section anchor (#)",
+  NON_WEB_PROTOCOL = "URL uses a non-web protocol (telnet, ftp, ssh, file, mailto, etc.)",
 }
 
 interface FilterLinksResult {
@@ -218,6 +219,24 @@ export class WebCrawler {
           return false;
         }
         const path = url.pathname;
+
+        const urlStr = url.toString();
+        const nonWebProtocols = [
+          "mailto:",
+          "tel:",
+          "telnet:",
+          "ftp:",
+          "ftps:",
+          "ssh:",
+          "file:",
+        ];
+        if (nonWebProtocols.some(protocol => urlStr.startsWith(protocol))) {
+          if (process.env.FIRECRAWL_DEBUG_FILTER_LINKS) {
+            this.logger.debug(`${link} NON-WEB PROTOCOL FAIL`);
+          }
+          denialReasons.set(link, DenialReason.NON_WEB_PROTOCOL);
+          return false;
+        }
 
         const depth = getURLDepth(url.toString());
 
@@ -464,8 +483,12 @@ export class WebCrawler {
       }
     };
 
+    let timeoutHandle: NodeJS.Timeout;
     const timeoutPromise = new Promise((_, reject) => {
-      setTimeout(() => reject(new Error("Sitemap fetch timeout")), timeout);
+      timeoutHandle = setTimeout(
+        () => reject(new Error("Sitemap fetch timeout")),
+        timeout,
+      );
     });
 
     // Allow sitemaps to be cached for 48 hours if they are requested from /map
@@ -496,7 +519,9 @@ export class WebCrawler {
           ),
         ]).then(results => results.reduce((a, x) => a + x, 0)),
         timeoutPromise,
-      ])) as number;
+      ]).finally(() => {
+        clearTimeout(timeoutHandle);
+      })) as number;
 
       if (count > 0) {
         if (

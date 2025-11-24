@@ -174,7 +174,15 @@ export async function crawlStatusController(
   res: Response<CrawlStatusResponse>,
   isBatch = false,
 ) {
-  const isPreviewTeam = req.auth.team_id?.startsWith("preview");
+  const uuidReg =
+    /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+  if (!req.params.jobId || !uuidReg.test(req.params.jobId)) {
+    return res.status(400).json({
+      success: false,
+      error: "Invalid job ID",
+    });
+  }
+
   const start =
     typeof req.query.skip === "string" ? parseInt(req.query.skip, 10) : 0;
   const end =
@@ -282,7 +290,7 @@ export async function crawlStatusController(
     next:
       (outputBulkA.total ?? 0) > start + iteratedOver ||
       outputBulkA.status !== "completed"
-        ? `${process.env.ENV === "local" ? req.protocol : "https"}://${req.get("host")}/v1/${isBatch ? "batch/scrape" : "crawl"}/${req.params.jobId}?skip=${start + iteratedOver}${req.query.limit ? `&limit=${req.query.limit}` : ""}`
+        ? `${req.protocol}://${req.get("host")}/v1/${isBatch ? "batch/scrape" : "crawl"}/${req.params.jobId}?skip=${start + iteratedOver}${req.query.limit ? `&limit=${req.query.limit}` : ""}`
         : undefined,
   };
 

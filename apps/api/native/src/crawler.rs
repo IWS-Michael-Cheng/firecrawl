@@ -7,6 +7,7 @@ use std::{
   sync::LazyLock,
 };
 use texting_robots::Robot;
+use tokio::task;
 use url::Url;
 
 static FILE_EXTENSIONS: &[&str] = &[
@@ -120,6 +121,7 @@ const FILE_TYPE: &str = "FILE_TYPE";
 const SOCIAL_MEDIA: &str = "SOCIAL_MEDIA";
 const EXTERNAL_LINK: &str = "EXTERNAL_LINK";
 const SECTION_LINK: &str = "SECTION_LINK";
+const NON_WEB_PROTOCOL: &str = "NON_WEB_PROTOCOL";
 
 #[inline]
 fn is_file(path: &str) -> bool {
@@ -170,6 +172,17 @@ fn no_sections(url_str: &str) -> bool {
 }
 
 #[inline]
+fn is_non_web_protocol(url_str: &str) -> bool {
+  const NON_WEB_PROTOCOLS: &[&str] = &[
+    "mailto:", "tel:", "telnet:", "ftp:", "ftps:", "ssh:", "file:",
+  ];
+
+  NON_WEB_PROTOCOLS
+    .iter()
+    .any(|protocol| url_str.starts_with(protocol))
+}
+
+#[inline]
 fn is_social_media_or_email(url_str: &str) -> bool {
   const SOCIAL_MEDIA_OR_EMAIL: &[&str] = &[
     "facebook.com",
@@ -177,7 +190,6 @@ fn is_social_media_or_email(url_str: &str) -> bool {
     "linkedin.com",
     "instagram.com",
     "pinterest.com",
-    "mailto:",
     "github.com",
     "calendly.com",
     "discord.gg",
@@ -267,6 +279,11 @@ fn _filter_links(data: FilterLinksCall) -> std::result::Result<FilterLinksResult
     let path = url.path();
     let url_str = url.as_str();
 
+    if is_non_web_protocol(url_str) {
+      denial_reasons.insert(link, NON_WEB_PROTOCOL.to_string());
+      continue;
+    }
+
     if get_url_depth(path) > data.max_depth {
       denial_reasons.insert(link, DEPTH_LIMIT.to_string());
       continue;
@@ -338,10 +355,12 @@ fn _filter_links(data: FilterLinksCall) -> std::result::Result<FilterLinksResult
         && is_subdomain(&url, &base_url)
       {
         // When allowing subdomains, still honor include patterns
-        let match_target = if data.regex_on_full_url { url_str } else { path };
-        if !includes_regex.is_empty()
-          && !includes_regex.iter().any(|r| r.is_match(match_target))
-        {
+        let match_target = if data.regex_on_full_url {
+          url_str
+        } else {
+          path
+        };
+        if !includes_regex.is_empty() && !includes_regex.iter().any(|r| r.is_match(match_target)) {
           denial_reasons.insert(link, INCLUDE_PATTERN.to_string());
           continue;
         }
@@ -361,9 +380,17 @@ fn _filter_links(data: FilterLinksCall) -> std::result::Result<FilterLinksResult
 
 /// Filter links based on crawling rules and constraints.
 #[napi]
-pub fn filter_links(data: FilterLinksCall) -> Result<FilterLinksResult> {
-  _filter_links(data)
-    .map_err(|e| Error::new(Status::GenericFailure, format!("Filter links error: {e}")))
+pub async fn filter_links(data: FilterLinksCall) -> Result<FilterLinksResult> {
+  let res = task::spawn_blocking(move || _filter_links(data))
+    .await
+    .map_err(|e| {
+      napi::Error::new(
+        napi::Status::GenericFailure,
+        format!("filter_links join error: {e}"),
+      )
+    })?;
+
+  res.map_err(|e| Error::new(Status::GenericFailure, format!("Filter links error: {e}")))
 }
 
 fn _filter_url(data: FilterUrlCall) -> std::result::Result<FilterUrlResult, String> {
@@ -416,6 +443,14 @@ fn _filter_url(data: FilterUrlCall) -> std::result::Result<FilterUrlResult, Stri
 
   let path = url.path();
   let url_str = url.as_str();
+
+  if is_non_web_protocol(url_str) {
+    return Ok(FilterUrlResult {
+      allowed: false,
+      url: None,
+      denial_reason: Some(NON_WEB_PROTOCOL.to_string()),
+    });
+  }
 
   let excludes_regex: Vec<Regex> = data
     .excludes
@@ -523,9 +558,17 @@ fn _filter_url(data: FilterUrlCall) -> std::result::Result<FilterUrlResult, Stri
 
 /// Filter a single URL based on crawling rules and constraints.
 #[napi]
-pub fn filter_url(data: FilterUrlCall) -> Result<FilterUrlResult> {
-  _filter_url(data)
-    .map_err(|e| Error::new(Status::GenericFailure, format!("Filter URL error: {e}")))
+pub async fn filter_url(data: FilterUrlCall) -> Result<FilterUrlResult> {
+  let res = task::spawn_blocking(move || _filter_url(data))
+    .await
+    .map_err(|e| {
+      napi::Error::new(
+        napi::Status::GenericFailure,
+        format!("filter_url join error: {e}"),
+      )
+    })?;
+
+  res.map_err(|e| Error::new(Status::GenericFailure, format!("Filter URL error: {e}")))
 }
 
 fn _parse_sitemap_xml(xml_content: &str) -> std::result::Result<ParsedSitemap, String> {
@@ -586,8 +629,17 @@ fn _parse_sitemap_xml(xml_content: &str) -> std::result::Result<ParsedSitemap, S
 
 /// Parse XML sitemap content into structured data.
 #[napi]
-pub fn parse_sitemap_xml(xml_content: String) -> Result<ParsedSitemap> {
-  _parse_sitemap_xml(&xml_content).map_err(|e| {
+pub async fn parse_sitemap_xml(xml_content: String) -> Result<ParsedSitemap> {
+  let res = task::spawn_blocking(move || _parse_sitemap_xml(&xml_content))
+    .await
+    .map_err(|e| {
+      napi::Error::new(
+        napi::Status::GenericFailure,
+        format!("parse_sitemap_xml join error: {e}"),
+      )
+    })?;
+
+  res.map_err(|e| {
     Error::new(
       Status::GenericFailure,
       format!("Parse sitemap XML error: {e}"),
@@ -670,13 +722,17 @@ fn _process_sitemap(xml_content: &str) -> std::result::Result<SitemapProcessingR
 
 /// Process sitemap XML and extract crawling instructions.
 #[napi]
-pub fn process_sitemap(xml_content: String) -> Result<SitemapProcessingResult> {
-  _process_sitemap(&xml_content).map_err(|e| {
-    Error::new(
-      Status::GenericFailure,
-      format!("Process sitemap error: {e}"),
-    )
-  })
+pub async fn process_sitemap(xml_content: String) -> Result<SitemapProcessingResult> {
+  let res = task::spawn_blocking(move || _process_sitemap(&xml_content))
+    .await
+    .map_err(|e| {
+      napi::Error::new(
+        napi::Status::GenericFailure,
+        format!("process_sitemap join error: {e}"),
+      )
+    })?;
+
+  res.map_err(|e| Error::new(Status::GenericFailure, format!("Parse sitemap error: {e}")))
 }
 
 #[cfg(test)]
@@ -976,8 +1032,7 @@ mod tests {
     // And should exclude blog due to includePaths
     assert!(result
       .denial_reasons
-      .get("https://sub.example.com/blog")
-      .is_some());
+      .contains_key("https://sub.example.com/blog"));
     assert_eq!(
       result
         .denial_reasons

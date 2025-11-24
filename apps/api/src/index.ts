@@ -34,6 +34,7 @@ import domainFrequencyRouter from "./routes/domain-frequency";
 import { nuqShutdown } from "./services/worker/nuq";
 import { getErrorContactMessage } from "./lib/deployment";
 import { initializeBlocklist } from "./scraper/WebScraper/utils/blocklist";
+import { initializeEngineForcing } from "./scraper/WebScraper/utils/engine-forcing";
 import responseTime from "response-time";
 
 const { createBullBoard } = require("@bull-board/api");
@@ -88,13 +89,12 @@ app.use(
   serverAdapter.getRouter(),
 );
 
-app.get("/", (req, res) => {
-  res.send("SCRAPERS-JS: Hello, world! K8s!");
+app.get("/", (_, res) => {
+  res.redirect("https://docs.firecrawl.dev/api-reference/v2-introduction");
 });
 
-//write a simple test function
-app.get("/test", async (req, res) => {
-  res.send("Hello, world!");
+app.get("/e2e-test", (_, res) => {
+  res.status(200).send("OK");
 });
 
 // register router
@@ -110,8 +110,11 @@ const HOST = process.env.HOST ?? "localhost";
 async function startServer(port = DEFAULT_PORT) {
   try {
     await initializeBlocklist();
+    initializeEngineForcing();
   } catch (error) {
-    logger.error("Failed to initialize blocklist", { error });
+    logger.error("Failed to initialize blocklist and engine forcing", {
+      error,
+    });
     throw error;
   }
 

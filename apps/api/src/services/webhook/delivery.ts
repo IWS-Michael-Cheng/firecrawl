@@ -62,7 +62,14 @@ export class WebhookSender {
   }
 
   private shouldSendEvent(event: WebhookEvent): boolean {
-    if (!this.config.events?.length) return true;
+    if (process.env.DISABLE_WEBHOOK_DELIVERY === "true") {
+      return false;
+    }
+
+    if (!this.config.events?.length) {
+      return true;
+    }
+
     const subType = event.split(".")[1];
     return this.config.events.includes(subType as any);
   }
@@ -91,13 +98,23 @@ export class WebhookSender {
       headers["X-Firecrawl-Signature"] = `sha256=${hmac.digest("hex")}`;
     }
 
+    const abortController = new AbortController();
+    const timeoutHandle = setTimeout(
+      () => {
+        if (abortController) {
+          abortController.abort();
+        }
+      },
+      this.context.v0 ? 30000 : 10000,
+    );
+
     try {
       const res = await undici.fetch(this.config.url, {
         method: "POST",
         headers,
         body: payloadString,
         dispatcher: getSecureDispatcher(),
-        signal: AbortSignal.timeout(this.context.v0 ? 30000 : 10000),
+        signal: abortController.signal,
       });
 
       if (!res.ok) {
@@ -139,6 +156,8 @@ export class WebhookSender {
       });
 
       throw error;
+    } finally {
+      if (timeoutHandle) clearTimeout(timeoutHandle);
     }
   }
 

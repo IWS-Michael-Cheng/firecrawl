@@ -54,6 +54,9 @@ CREATE INDEX IF NOT EXISTS nuq_queue_scrape_group_mode_status_idx ON nuq.queue_s
 -- For getCrawlJobsForListing: query by group_id, status='completed', data->>'mode', ordered by finished_at, created_at
 CREATE INDEX IF NOT EXISTS nuq_queue_scrape_group_completed_listing_idx ON nuq.queue_scrape (group_id, finished_at ASC, created_at ASC) WHERE (status = 'completed'::nuq.job_status AND (data->>'mode') = 'single_urls');
 
+-- For group finish cron
+CREATE INDEX IF NOT EXISTS idx_queue_scrape_group_status ON nuq.queue_scrape (group_id, status) WHERE status IN ('active', 'queued');
+
 CREATE TABLE IF NOT EXISTS nuq.queue_scrape_backlog (
   id uuid NOT NULL DEFAULT gen_random_uuid(),
   data jsonb,
@@ -149,11 +152,18 @@ CREATE TABLE IF NOT EXISTS nuq.group_crawl (
   CONSTRAINT group_crawl_pkey PRIMARY KEY (id)
 );
 
+-- Index for group finish cron to find active groups
+CREATE INDEX IF NOT EXISTS idx_group_crawl_status ON nuq.group_crawl (status) WHERE status = 'active'::nuq.group_status;
+
+-- Index for backlog group_id lookups
+CREATE INDEX IF NOT EXISTS idx_queue_scrape_backlog_group_id ON nuq.queue_scrape_backlog (group_id);
+
 SELECT cron.schedule('nuq_group_crawl_finished', '15 seconds', $$
   WITH finished_groups AS (
     UPDATE nuq.group_crawl
-    SET status = 'completed'::nuq.group_status, expires_at = now() + MAKE_INTERVAL(secs => nuq.group_crawl.ttl / 1000)
-    WHERE nuq.group_crawl.status = 'active'::nuq.group_status
+    SET status = 'completed'::nuq.group_status,
+        expires_at = now() + MAKE_INTERVAL(secs => nuq.group_crawl.ttl / 1000)
+    WHERE status = 'active'::nuq.group_status
       AND NOT EXISTS (
         SELECT 1 FROM nuq.queue_scrape
         WHERE nuq.queue_scrape.status IN ('active', 'queued')
@@ -174,8 +184,8 @@ SELECT cron.schedule('nuq_group_crawl_clean', '*/5 * * * *', $$
   WITH cleaned_groups AS (
     DELETE FROM nuq.group_crawl
     WHERE nuq.group_crawl.status = 'completed'::nuq.group_status
-      AND nuq.group_crawl.expires_at < now();
-    RETURNING *;
+      AND nuq.group_crawl.expires_at < now()
+    RETURNING *
   ), cleaned_jobs_queue_scrape AS (
     DELETE FROM nuq.queue_scrape
     WHERE nuq.queue_scrape.group_id IN (SELECT id FROM cleaned_groups)
@@ -185,5 +195,6 @@ SELECT cron.schedule('nuq_group_crawl_clean', '*/5 * * * *', $$
   ), cleaned_jobs_crawl_finished AS (
     DELETE FROM nuq.queue_crawl_finished
     WHERE nuq.queue_crawl_finished.group_id IN (SELECT id FROM cleaned_groups)
-  );
+  )
+  SELECT 1;
 $$);

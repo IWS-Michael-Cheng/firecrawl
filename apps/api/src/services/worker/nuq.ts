@@ -59,11 +59,12 @@ function normalizeOwnerId(ownerId: string | undefined | null): string | null {
   return uuidv5(ownerId, normalizedUUIDNamespace);
 }
 
-const listenChannelId = process.env.NUQ_POD_NAME ?? "main";
-
 // === Queue
 
 class NuQ<JobData = any, JobReturnValue = any> {
+  private listenChannelId: string =
+    (process.env.NUQ_POD_NAME ?? "main") + "-" + crypto.randomUUID();
+
   constructor(
     public readonly queueName: string,
     public readonly options: NuQOptions,
@@ -86,34 +87,41 @@ class NuQ<JobData = any, JobReturnValue = any> {
   private listens: {
     [key: string]: ((status: "completed" | "failed") => void)[];
   } = {};
+  private listenerStarting = false;
   private shuttingDown = false;
 
   private async startListener() {
-    if (this.listener || this.shuttingDown) return;
+    if (this.listener || this.shuttingDown || this.listenerStarting) return;
 
     if (process.env.NUQ_RABBITMQ_URL) {
-      const connection = await amqp.connect(process.env.NUQ_RABBITMQ_URL);
-      const channel = await connection.createChannel();
-      await channel.prefetch(1);
-      const queue = await channel.assertQueue(
-        this.queueName + ".listen." + listenChannelId,
-        {
-          exclusive: true,
-          autoDelete: true,
-          durable: false,
-          arguments: {
-            "x-queue-type": "classic",
-            "x-message-ttl": 60000,
-          },
-        },
-      );
+      this.listenerStarting = true;
 
-      this.listener = {
-        type: "rabbitmq",
-        connection,
-        channel,
-        queue: queue.queue,
-      };
+      try {
+        const connection = await amqp.connect(process.env.NUQ_RABBITMQ_URL);
+        const channel = await connection.createChannel();
+        await channel.prefetch(1);
+        const queue = await channel.assertQueue(
+          this.queueName + ".listen." + this.listenChannelId,
+          {
+            exclusive: true,
+            autoDelete: true,
+            durable: false,
+            arguments: {
+              "x-queue-type": "classic",
+              "x-message-ttl": 60000,
+            },
+          },
+        );
+
+        this.listener = {
+          type: "rabbitmq",
+          connection,
+          channel,
+          queue: queue.queue,
+        };
+      } finally {
+        this.listenerStarting = false;
+      }
 
       let reconnectTimeout: NodeJS.Timeout | null = null;
 
@@ -138,8 +146,8 @@ class NuQ<JobData = any, JobReturnValue = any> {
         return;
       }.bind(this);
 
-      connection.on("close", onClose);
-      channel.on("close", onClose);
+      this.listener.connection.on("close", onClose);
+      this.listener.channel.on("close", onClose);
 
       await this.listener.channel.consume(
         this.listener.queue,
@@ -447,6 +455,30 @@ class NuQ<JobData = any, JobReturnValue = any> {
     }
   }
 
+  public async getJobsFromBacklog(
+    ids: string[],
+    _logger: Logger = logger,
+  ): Promise<NuQJob<JobData, JobReturnValue>[]> {
+    if (ids.length === 0) return [];
+
+    const start = Date.now();
+    try {
+      return (
+        await nuqPool.query(
+          `SELECT ${this.jobBacklogReturning.join(", ")} FROM ${this.queueName}_backlog WHERE ${this.queueName}_backlog.id = ANY($1::uuid[]);`,
+          [ids],
+        )
+      ).rows.map(row => this.rowToJob(row, true)!);
+    } finally {
+      _logger.info("nuqGetJobsFromBacklog metrics", {
+        module: "nuq/metrics",
+        method: "nuqGetJobsFromBacklog",
+        duration: Date.now() - start,
+        scrapeIds: ids.length,
+      });
+    }
+  }
+
   public async getJobsWithStatus(
     ids: string[],
     status: NuQJobStatus,
@@ -551,6 +583,47 @@ class NuQ<JobData = any, JobReturnValue = any> {
         method: "nuqGetGroupNumericStats",
         duration: Date.now() - start,
         crawlId: groupId,
+      });
+    }
+  }
+
+  public async getBackloggedOwnerIDs(
+    _logger: Logger = logger,
+  ): Promise<string[]> {
+    const start = Date.now();
+    try {
+      return (
+        await nuqPool.query(
+          `SELECT DISTINCT owner_id FROM ${this.queueName}_backlog;`,
+        )
+      ).rows.map(row => row.owner_id);
+    } finally {
+      _logger.info("nuqGetBackloggedOwnerIDs metrics", {
+        module: "nuq/metrics",
+        method: "nuqGetBackloggedOwnerIDs",
+        duration: Date.now() - start,
+      });
+    }
+  }
+
+  public async getBackloggedJobIDsOfOnwer(
+    ownerId: string,
+    _logger: Logger = logger,
+  ): Promise<string[]> {
+    const start = Date.now();
+    try {
+      return (
+        await nuqPool.query(
+          `SELECT id FROM ${this.queueName}_backlog WHERE owner_id = $1;`,
+          [ownerId],
+        )
+      ).rows.map(row => row.id);
+    } finally {
+      _logger.info("nuqGetBackloggedJobIDsOfOnwer metrics", {
+        module: "nuq/metrics",
+        method: "nuqGetBackloggedJobIDsOfOnwer",
+        duration: Date.now() - start,
+        ownerId,
       });
     }
   }
@@ -662,7 +735,7 @@ class NuQ<JobData = any, JobReturnValue = any> {
                 id,
                 data,
                 options.priority ?? 0,
-                options.listenable ? listenChannelId : null,
+                options.listenable ? this.listenChannelId : null,
                 normalizeOwnerId(options.ownerId),
                 options.groupId ?? null,
                 ...(options.backlogged
@@ -679,6 +752,66 @@ class NuQ<JobData = any, JobReturnValue = any> {
 
         setSpanAttributes(span, {
           "nuq.job_created": true,
+        });
+
+        return result;
+      } finally {
+        const duration = Date.now() - start;
+        setSpanAttributes(span, {
+          "nuq.duration_ms": duration,
+        });
+        logger.info("nuqAddJob metrics", {
+          module: "nuq/metrics",
+          method: "nuqAddJob",
+          duration,
+          scrapeId: id,
+          zeroDataRetention: (data as any)?.zeroDataRetention ?? false,
+        });
+      }
+    });
+  }
+
+  public async addJobIfNotExists(
+    id: string,
+    data: JobData,
+    options: NuQJobOptions,
+  ): Promise<NuQJob<JobData, JobReturnValue> | null> {
+    return withSpan("nuq.addJob", async span => {
+      setSpanAttributes(span, {
+        "nuq.queue_name": this.queueName,
+        "nuq.job_id": id,
+        "nuq.priority": options.priority ?? 0,
+        "nuq.zero_data_retention": (data as any)?.zeroDataRetention ?? false,
+        "nuq.listenable": options.listenable ?? false,
+      });
+
+      const start = Date.now();
+      try {
+        const result = this.rowToJob(
+          (
+            await nuqPool.query(
+              `INSERT INTO ${this.queueName}${options.backlogged ? "_backlog" : ""} (id, data, priority, listen_channel_id, owner_id, group_id${options.backlogged ? ", times_out_at" : ""}) VALUES ($1, $2, $3, $4, $5, $6${options.backlogged ? ", $7" : ""}) ON CONFLICT (id) DO NOTHING RETURNING ${(options.backlogged ? this.jobBacklogReturning : this.jobReturning).join(", ")};`,
+              [
+                id,
+                data,
+                options.priority ?? 0,
+                options.listenable ? this.listenChannelId : null,
+                normalizeOwnerId(options.ownerId),
+                options.groupId ?? null,
+                ...(options.backlogged
+                  ? [
+                      options.backloggedTimesOutAt
+                        ? options.backloggedTimesOutAt.toISOString()
+                        : null,
+                    ]
+                  : []),
+              ],
+            )
+          ).rows[0],
+        );
+
+        setSpanAttributes(span, {
+          "nuq.job_created": result !== null,
         });
 
         return result;
@@ -780,7 +913,7 @@ class NuQ<JobData = any, JobReturnValue = any> {
                   job.id,
                   job.data,
                   job.options.priority ?? 0,
-                  job.options.listenable ? listenChannelId : null,
+                  job.options.listenable ? this.listenChannelId : null,
                   normalizeOwnerId(job.options.ownerId),
                   job.options.groupId ?? null,
                   ...(tableSuffix === "_backlog"
@@ -847,7 +980,7 @@ class NuQ<JobData = any, JobReturnValue = any> {
     id: string,
     data: JobData,
     options: NuQJobOptions,
-  ): Promise<NuQJob<JobData, JobReturnValue>> {
+  ): Promise<NuQJob<JobData, JobReturnValue> | null> {
     return withSpan("nuq.promoteJobFromBacklogOrAdd", async span => {
       setSpanAttributes(span, {
         "nuq.queue_name": this.queueName,
@@ -869,6 +1002,7 @@ class NuQ<JobData = any, JobReturnValue = any> {
                   FROM ${this.queueName}_backlog b
                   WHERE b.id = $1
                   LIMIT 1
+                  ON CONFLICT (id) DO NOTHING
                   RETURNING ${this.jobReturning.join(", ")}
                 ), del AS (
                   DELETE FROM ${this.queueName}_backlog
@@ -882,7 +1016,7 @@ class NuQ<JobData = any, JobReturnValue = any> {
         );
 
         if (!result) {
-          return await this.addJob(id, data, {
+          return await this.addJobIfNotExists(id, data, {
             ...options,
             backlogged: false,
           });
@@ -1242,9 +1376,13 @@ class NuQ<JobData = any, JobReturnValue = any> {
   // === Metrics
   public async getMetrics(): Promise<string> {
     const start = Date.now();
+    // swapped to slim version for performance reasons - mogery
+    // const result = await nuqPool.query(`
+    //   SELECT status::text, COUNT(id) as count FROM ${this.queueName} GROUP BY status
+    //   ${this.options.backlog ? `UNION ALL SELECT 'backlog'::text as status, COUNT(id) as count FROM ${this.queueName}_backlog` : ""}
+    // `);
     const result = await nuqPool.query(`
-      SELECT status::text, COUNT(id) as count FROM ${this.queueName} GROUP BY status
-      ${this.options.backlog ? `UNION ALL SELECT 'backlog'::text as status, COUNT(id) as count FROM ${this.queueName}_backlog` : ""}
+      SELECT status::text, COUNT(id) as count FROM ${this.queueName} WHERE status IN ('queued', 'active') GROUP BY status
     `);
     logger.info("nuqGetMetrics metrics", {
       module: "nuq/metrics",

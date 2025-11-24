@@ -67,8 +67,6 @@ async function scrapePDFWithRunPodMU(
     maxPages,
   });
 
-
-
   if (
     process.env.PDF_MU_V2_EXPERIMENT === "true" &&
     process.env.PDF_MU_V2_BASE_URL &&
@@ -76,8 +74,15 @@ async function scrapePDFWithRunPodMU(
       Number(process.env.PDF_MU_V2_EXPERIMENT_PERCENT ?? "100")
   ) {
     (async () => {
+      const pdfParseId = crypto.randomUUID();
       const startedAt = Date.now();
       const logger = meta.logger.child({ method: "scrapePDF/MUv2Experiment" });
+      logger.info("MU v2 experiment started", {
+        scrapeId: meta.id,
+        pdfParseId,
+        url: meta.rewrittenUrl ?? meta.url,
+        maxPages,
+      });
       try {
         const resp = await robustFetch({
           url: process.env.PDF_MU_V2_BASE_URL ?? "",
@@ -88,6 +93,7 @@ async function scrapePDFWithRunPodMU(
               filename: path.basename(tempFilePath) + ".pdf",
               timeout: meta.abort.scrapeTimeout(),
               created_at: Date.now(),
+              id: pdfParseId,
               ...(maxPages !== undefined && { max_pages: maxPages }),
             },
           },
@@ -114,7 +120,6 @@ async function scrapePDFWithRunPodMU(
       }
     })();
   }
-
 
   const muV1StartedAt = Date.now();
   const podStart = await robustFetch({
@@ -263,6 +268,7 @@ export async function scrapePDF(meta: Meta): Promise<EngineScrapeResult> {
     } else {
       const file = await fetchFileToBuffer(meta.rewrittenUrl ?? meta.url, {
         headers: meta.options.headers,
+        signal: meta.abort.asSignal(),
       });
 
       const ct = file.response.headers.get("Content-Type");
@@ -298,6 +304,7 @@ export async function scrapePDF(meta: Meta): Promise<EngineScrapeResult> {
       ? { response: meta.pdfPrefetch, tempFilePath: meta.pdfPrefetch.filePath }
       : await downloadFile(meta.id, meta.rewrittenUrl ?? meta.url, {
           headers: meta.options.headers,
+          signal: meta.abort.asSignal(),
         });
 
   if ((response as any).headers) {
@@ -344,50 +351,6 @@ export async function scrapePDF(meta: Meta): Promise<EngineScrapeResult> {
     process.env.RUNPOD_MU_API_KEY &&
     process.env.RUNPOD_MU_POD_ID
   ) {
-    // Minimal experiment: fire MU v2 in background if enabled; do not await
-    if (
-      process.env.PDF_MU_V2_EXPERIMENT === "true" &&
-      process.env.PDF_MU_V2_BASE_URL
-    ) {
-      (async () => {
-        const startedAt = Date.now();
-        const logger = meta.logger.child({ method: "scrapePDF/MUv2Experiment" });
-        try {
-          const resp = await robustFetch({
-            url: process.env.PDF_MU_V2_BASE_URL ?? "",
-            method: "POST",
-            body: {
-              input: {
-                file_content: base64Content,
-                filename: path.basename(tempFilePath) + ".pdf",
-                timeout: meta.abort.scrapeTimeout(),
-                created_at: Date.now(),
-                ...(maxPages !== undefined && { max_pages: maxPages }),
-              },
-            },
-            logger,
-            schema: z.any(),
-            mock: meta.mock,
-            abort: meta.abort.asSignal(),
-          });
-          const body: any = resp as any;
-          const tokensIn = body?.metadata?.["total-input-tokens"];
-          const tokensOut = body?.metadata?.["total-output-tokens"];
-          const pages = body?.metadata?.["pdf-total-pages"];
-          const durationMs = Date.now() - startedAt;
-          logger.info("MU v2 experiment completed", {
-            durationMs,
-            url: meta.rewrittenUrl ?? meta.url,
-            tokensIn,
-            tokensOut,
-            pages,
-          });
-        } catch (error) {
-          const durationMs = Date.now() - startedAt;
-          logger.warn("MU v2 experiment failed", { error, durationMs });
-        }
-      })();
-    }
     const muV1StartedAt = Date.now();
     try {
       result = await scrapePDFWithRunPodMU(
