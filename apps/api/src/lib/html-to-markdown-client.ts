@@ -6,6 +6,7 @@
  */
 
 import axios, { AxiosInstance, AxiosError } from "axios";
+import { config } from "../config";
 import { logger } from "./logger";
 import * as Sentry from "@sentry/node";
 
@@ -38,10 +39,7 @@ export async function convertHTMLToMarkdownWithHttpService(
     return "";
   }
 
-  const url =
-    serviceUrl ||
-    process.env.HTML_TO_MARKDOWN_SERVICE_URL ||
-    "http://localhost:8080";
+  const url = serviceUrl || config.HTML_TO_MARKDOWN_SERVICE_URL;
   const startTime = Date.now();
 
   try {
@@ -51,7 +49,7 @@ export async function convertHTMLToMarkdownWithHttpService(
       `${url}/convert`,
       request,
       {
-        timeout: 30000, // 30 second timeout
+        timeout: 60_000,
         headers: {
           "Content-Type": "application/json",
         },

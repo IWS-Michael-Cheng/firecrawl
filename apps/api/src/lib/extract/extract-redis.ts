@@ -40,6 +40,7 @@ type StoredExtract = {
   };
   sessionIds?: string[];
   tokensBilled?: number;
+  creditsBilled?: number;
   zeroDataRetention?: boolean;
 };
 
@@ -68,8 +69,9 @@ export async function saveExtract(id: string, extract: StoredExtract) {
   await redisEvictConnection.set(
     "extract:" + id,
     JSON.stringify(minimalExtract),
+    "EX",
+    EXTRACT_TTL,
   );
-  await redisEvictConnection.expire("extract:" + id, EXTRACT_TTL);
 }
 
 export async function getExtract(id: string): Promise<StoredExtract | null> {
@@ -130,8 +132,9 @@ export async function updateExtract(
   await redisEvictConnection.set(
     "extract:" + id,
     JSON.stringify(minimalExtract),
+    "EX",
+    EXTRACT_TTL,
   );
-  await redisEvictConnection.expire("extract:" + id, EXTRACT_TTL);
 }
 
 export async function getExtractExpiry(id: string): Promise<Date> {

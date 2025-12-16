@@ -1,12 +1,13 @@
 import "dotenv/config";
-import { shutdownOtel } from "../otel";
+import { config } from "../config";
 import "./sentry";
+import { setSentryServiceTag } from "./sentry";
 import * as Sentry from "@sentry/node";
 import { getExtractQueue, getRedisConnection } from "./queue-service";
 import { Job, Queue, Worker } from "bullmq";
 import { logger as _logger } from "../lib/logger";
 import systemMonitor from "./system-monitor";
-import { v4 as uuidv4 } from "uuid";
+import { v7 as uuidv7 } from "uuid";
 import { configDotenv } from "dotenv";
 import {
   ExtractResult,
@@ -17,8 +18,8 @@ import { performExtraction_F0 } from "../lib/extract/fire-0/extraction-service-f
 import { createWebhookSender, WebhookEvent } from "./webhook";
 import Express from "express";
 import { robustFetch } from "../scraper/scrapeURL/lib/fetch";
-import { BullMQOtel } from "bullmq-otel";
 import { getErrorContactMessage } from "../lib/deployment";
+import { TransportableError } from "../lib/error";
 import { initializeBlocklist } from "../scraper/WebScraper/utils/blocklist";
 import { initializeEngineForcing } from "../scraper/WebScraper/utils/engine-forcing";
 
@@ -26,16 +27,12 @@ configDotenv();
 
 const sleep = (ms: number) => new Promise(resolve => setTimeout(resolve, ms));
 
-const jobLockExtendInterval =
-  Number(process.env.JOB_LOCK_EXTEND_INTERVAL) || 10000;
-const jobLockExtensionTime =
-  Number(process.env.JOB_LOCK_EXTENSION_TIME) || 60000;
+const jobLockExtendInterval = config.JOB_LOCK_EXTEND_INTERVAL;
+const jobLockExtensionTime = config.JOB_LOCK_EXTENSION_TIME;
 
-const cantAcceptConnectionInterval =
-  Number(process.env.CANT_ACCEPT_CONNECTION_INTERVAL) || 2000;
-const connectionMonitorInterval =
-  Number(process.env.CONNECTION_MONITOR_INTERVAL) || 10;
-const gotJobInterval = Number(process.env.CONNECTION_MONITOR_INTERVAL) || 20;
+const cantAcceptConnectionInterval = config.CANT_ACCEPT_CONNECTION_INTERVAL;
+const connectionMonitorInterval = config.CONNECTION_MONITOR_INTERVAL;
+const gotJobInterval = config.CONNECTION_MONITOR_INTERVAL;
 
 const runningJobs: Set<string> = new Set();
 
@@ -99,7 +96,14 @@ const processExtractJobInternal = async (
     // });
 
     if (result && result.success) {
-      // Move job to completed state in Redis
+      await updateExtract(job.data.extractId, {
+        status: "completed",
+        llmUsage: result.llmUsage,
+        sources: result.sources,
+        tokensBilled: result.tokensBilled,
+        creditsBilled: result.creditsBilled,
+      });
+
       await job.moveToCompleted(result, token, false);
 
       if (sender) {
@@ -111,12 +115,12 @@ const processExtractJobInternal = async (
 
       return result;
     } else {
-      // throw new Error(result.error || "Unknown error during extraction");
-
-      await job.moveToCompleted(result, token, false);
       await updateExtract(job.data.extractId, {
+        status: "failed",
         error: result?.error ?? getErrorContactMessage(job.data.extractId),
       });
+
+      await job.moveToCompleted(result, token, false);
 
       if (sender) {
         sender.send(WebhookEvent.EXTRACT_FAILED, {
@@ -130,23 +134,25 @@ const processExtractJobInternal = async (
   } catch (error) {
     logger.error(`🚫 Job errored ${job.id} - ${error}`, { error });
 
-    Sentry.captureException(error, {
-      data: {
-        job: job.id,
-      },
-    });
-
-    try {
-      // Move job to failed state in Redis
-      await job.moveToFailed(error, token, false);
-    } catch (e) {
-      logger.log("Failed to move job to failed state in Redis", { error });
+    // Filter out TransportableErrors (flow control)
+    if (!(error instanceof TransportableError)) {
+      Sentry.captureException(error, {
+        data: {
+          job: job.id,
+        },
+      });
     }
 
     await updateExtract(job.data.extractId, {
       status: "failed",
       error: error.error ?? error ?? getErrorContactMessage(job.data.extractId),
     });
+
+    try {
+      await job.moveToFailed(error, token, false);
+    } catch (e) {
+      logger.log("Failed to move job to failed state in BullMQ", { error });
+    }
 
     if (sender) {
       sender.send(WebhookEvent.EXTRACT_FAILED, {
@@ -169,15 +175,17 @@ const processExtractJobInternal = async (
 let isShuttingDown = false;
 let isWorkerStalled = false;
 
-process.on("SIGINT", () => {
-  _logger.debug("Received SIGINT. Shutting down gracefully...");
-  isShuttingDown = true;
-});
+if (require.main === module) {
+  process.on("SIGINT", () => {
+    _logger.debug("Received SIGINT. Shutting down gracefully...");
+    isShuttingDown = true;
+  });
 
-process.on("SIGTERM", () => {
-  _logger.debug("Received SIGTERM. Shutting down gracefully...");
-  isShuttingDown = true;
-});
+  process.on("SIGTERM", () => {
+    _logger.debug("Received SIGTERM. Shutting down gracefully...");
+    isShuttingDown = true;
+  });
+}
 
 let cantAcceptConnectionCount = 0;
 
@@ -192,7 +200,6 @@ const workerFun = async (
     lockDuration: 60 * 1000, // 60 seconds
     stalledInterval: 60 * 1000, // 60 seconds
     maxStalledCount: 10, // 10 times
-    telemetry: new BullMQOtel("firecrawl-bullmq"),
   });
 
   worker.startStalledCheckTimer();
@@ -204,7 +211,7 @@ const workerFun = async (
       _logger.info("No longer accepting new jobs. SIGINT");
       break;
     }
-    const token = uuidv4();
+    const token = uuidv7();
     const canAcceptConnection = await monitor.acceptConnection();
     if (!canAcceptConnection) {
       console.log("Can't accept connection due to RAM/CPU load");
@@ -257,11 +264,11 @@ let currentLiveness: boolean = true;
 
 app.get("/liveness", (req, res) => {
   _logger.info("Liveness endpoint hit");
-  if (process.env.USE_DB_AUTHENTICATION === "true") {
+  if (config.USE_DB_AUTHENTICATION) {
     // networking check for Kubernetes environments
-    const host = process.env.FIRECRAWL_APP_HOST || "firecrawl-app-service";
-    const port = process.env.FIRECRAWL_APP_PORT || "3002";
-    const scheme = process.env.FIRECRAWL_APP_SCHEME || "http";
+    const host = config.FIRECRAWL_APP_HOST;
+    const port = config.FIRECRAWL_APP_PORT;
+    const scheme = config.FIRECRAWL_APP_SCHEME;
 
     robustFetch({
       url: `${scheme}://${host}:${port}`,
@@ -287,12 +294,14 @@ app.get("/liveness", (req, res) => {
   }
 });
 
-const workerPort = process.env.EXTRACT_WORKER_PORT || process.env.PORT || 3005;
+const workerPort = config.EXTRACT_WORKER_PORT || config.PORT;
 app.listen(workerPort, () => {
   _logger.info(`Liveness endpoint is running on port ${workerPort}`);
 });
 
 (async () => {
+  setSentryServiceTag("extract-worker");
+
   await initializeBlocklist().catch(e => {
     _logger.error("Failed to initialize blocklist", { error: e });
     process.exit(1);
@@ -309,8 +318,5 @@ app.listen(workerPort, () => {
   }
 
   _logger.info("All jobs finished. Shutting down...");
-  shutdownOtel().finally(() => {
-    _logger.debug("OTEL shutdown");
-    process.exit(0);
-  });
+  process.exit(0);
 })();

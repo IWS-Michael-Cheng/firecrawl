@@ -17,7 +17,9 @@ import { BLOCKLISTED_URL_MESSAGE } from "../lib/strings";
 import { addDomainFrequencyJob } from "../services";
 import * as geoip from "geoip-country";
 import { isSelfHosted } from "../lib/deployment";
+import { validate as isUuid } from "uuid";
 
+import { config } from "../config";
 export function checkCreditsMiddleware(
   _minimum?: number,
 ): (req: RequestWithAuth, res: Response, next: NextFunction) => void {
@@ -212,7 +214,8 @@ export function countryCheck(
         Object.keys(req.body.scrapeOptions.headers).length > 0) ||
       req.body.scrapeOptions?.agent ||
       req.body.scrapeOptions?.jsonOptions?.agent ||
-      req.body.scrapeOptions?.extract?.agent);
+      req.body.scrapeOptions?.extract?.agent ||
+      req.path.startsWith("/v2/agent"));
 
   if (!couldBeRestricted) {
     return next();
@@ -229,8 +232,7 @@ export function countryCheck(
     return next();
   }
 
-  const restricted = process.env.RESTRICTED_COUNTRIES?.split(",") ?? [];
-  if (restricted.includes(country.country)) {
+  if (config.RESTRICTED_COUNTRIES?.includes(country.country)) {
     logger.warn("Denied access to restricted country", {
       ip: req.ip,
       country: country.country,
@@ -241,6 +243,25 @@ export function countryCheck(
       error: isSelfHosted()
         ? "Use of headers, actions, and the FIRE-1 agent is not allowed by default in your country. Please check your server configuration."
         : "Use of headers, actions, and the FIRE-1 agent is not allowed by default in your country. Please contact us at help@firecrawl.com",
+    });
+  }
+
+  next();
+}
+
+export function isValidJobId(jobId: string | undefined): jobId is string {
+  return typeof jobId === "string" && isUuid(jobId);
+}
+
+export function validateJobIdParam(
+  req: Request<{ jobId?: string }>,
+  res: Response,
+  next: NextFunction,
+) {
+  if (!isValidJobId(req.params.jobId)) {
+    return res.status(400).json({
+      success: false,
+      error: "Invalid job ID format. Job ID must be a valid UUID.",
     });
   }
 
